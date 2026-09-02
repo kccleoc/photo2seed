@@ -450,37 +450,41 @@ def render_qr(data, out_path, top_text=None, bottom_text=None):
     font_bottom = ImageFont.load_default(size=26)
     pad_x, pad_y = 16, 12
 
-    def band_height(font):
-        ascent, descent = font.getmetrics()
-        return ascent + descent + 2 * pad_y
+    probe = Image.new("RGB", (1, 1), "white")
+    probe_draw = ImageDraw.Draw(probe)
 
-    def text_width(draw, font, text):
+    def glyph_h(draw, font, text):
+        bbox = draw.textbbox((0, 0), text, font=font)
+        return bbox[3] - bbox[1]
+
+    def glyph_w(draw, font, text):
         bbox = draw.textbbox((0, 0), text, font=font)
         return bbox[2] - bbox[0]
 
-    draw_probe = ImageDraw.Draw(qr_img)
-    top_h = band_height(font_top) if top_text else 0
-    bot_h = band_height(font_bottom) if bottom_text else 0
+    def band_height(draw, font, text):
+        return glyph_h(draw, font, text) + 2 * pad_y
+
+    top_h = band_height(probe_draw, font_top, top_text) if top_text else 0
+    bot_h = band_height(probe_draw, font_bottom, bottom_text) if bottom_text else 0
     inner_w = max(qr_w, 2 * pad_x)
     if top_text:
-        inner_w = max(inner_w, text_width(draw_probe, font_top, top_text) + 2 * pad_x)
+        inner_w = max(inner_w, glyph_w(probe_draw, font_top, top_text) + 2 * pad_x)
     if bottom_text:
-        inner_w = max(inner_w, text_width(draw_probe, font_bottom, bottom_text) + 2 * pad_x)
+        inner_w = max(inner_w, glyph_w(probe_draw, font_bottom, bottom_text) + 2 * pad_x)
 
     canvas = Image.new("RGB", (inner_w, top_h + qr_h + bot_h), "white")
     canvas.paste(qr_img, ((inner_w - qr_w) // 2, top_h))
     draw = ImageDraw.Draw(canvas)
 
-    def center(font, text, y):
-        bbox = draw.textbbox((0, 0), text, font=font)
-        ascent, _descent = font.getmetrics()
-        x = (inner_w - (bbox[2] - bbox[0])) // 2
-        draw.text((x, y + pad_y + ascent), text, font=font, fill="black")
+    def center(font, text, x_center, y_center):
+        draw.text((x_center, y_center), text, font=font, fill="black", anchor="mm")
 
     if top_text:
-        center(font_top, top_text, 0)
+        center(font_top, top_text, inner_w // 2,
+               pad_y + glyph_h(draw, font_top, top_text) // 2)
     if bottom_text:
-        center(font_bottom, bottom_text, top_h + qr_h)
+        center(font_bottom, bottom_text, inner_w // 2,
+               top_h + qr_h + pad_y + glyph_h(draw, font_bottom, bottom_text) // 2)
 
     canvas.save(out_path)
     print("QR saved: %s (%dx%d px)" % (out_path, inner_w, top_h + qr_h + bot_h))
