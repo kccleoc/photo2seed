@@ -1,0 +1,48 @@
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux-amd64:
+    # Tails / Debian amd64 binary
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned build deps
+        run: pip install -r build-requirements.txt
+      - name: Build single binary
+        run: >
+          pyinstaller --onefile --add-data "english.txt:." --exclude-module tkinter
+          --clean --noconfirm --strip --name photo2seed-linux-amd64 photo2seed.py
+      - name: Smoke test
+        run: |
+          python -c "from PIL import Image; import random; Image.frombytes('L',(512,512),bytes(random.getrandbits(8) for _ in range(512*512))).save('test.png')"
+          ./dist/photo2seed-linux-amd64 --version
+          ./dist/photo2seed-linux-amd64 --derive-only test.png >/dev/null
+          ! ./dist/photo2seed-linux-amd64 --derive-only test.png 2>/dev/null | grep -E "sha512=|Final SHA-512|entropy \("
+          file dist/photo2seed-linux-amd64 | grep -q "x86-64"
+      - name: Checksums
+        run: cd dist && sha256sum photo2seed-linux-amd64 > SHA256SUMS && cat SHA256SUMS
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: photo2seed-linux-amd64
+          path: |
+            dist/photo2seed-linux-amd64
+            dist/SHA256SUMS
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/photo2seed-linux-amd64
+            dist/SHA256SUMS

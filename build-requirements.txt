@@ -1,0 +1,5 @@
+# Runtime dependencies (pinned - see requirements.txt)
+-r requirements.txt
+
+# Build-time only
+pyinstaller==6.22.2
