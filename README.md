@@ -35,18 +35,23 @@ are picked up automatically. Or build a **single self-contained binary** — see
 
 ```bash
 photo2seed PATH... [options]
+photo2seed --download-random [N] [options]   # no PATH needed - fetch random photos
 ```
 
 Default behavior: photos in → seed derived → **KEF password prompted** →
 **KEF QR PNG written**. Seed material is **not printed** unless you pass
 `--show-words`.
 
-`PATH...` accepts one or more image files and/or directories (recursive).
+`PATH...` accepts one or more image files and/or directories (recursive), and
+is **optional** when `--download-random` is used. The two may be combined
+(your photos plus the downloaded ones all feed the entropy).
 
 Examples:
 
 ```bash
 photo2seed ~/Pictures/trip/                  # default: words -> KEF QR PNG + password
+photo2seed --download-random                 # fetch 10 random photos to /tmp, then derive
+photo2seed --download-random 3 ~/own/         # 3 random photos + your own folder
 photo2seed a.jpg some/dir/ --words 24         # 24-word seed
 photo2seed photos/ --show-words              # also print words/entropy/hashes
 photo2seed photos/ --xfp                     # also show the master-key fingerprint
@@ -58,6 +63,7 @@ photo2seed install / photo2seed uninstall    # add / remove the command
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--words 12\|24` | `12` | BIP39 mnemonic length (128 / 256-bit entropy) |
+| `--download-random [N]` | off | Fetch N random [Picsum](https://picsum.photos) photos (1–10, default 10) into a fresh `/tmp` dir and use them as a photo source; requires network, mixes CSPRNG (cannot combine with `--no-mix-rng`) |
 | `--id LABEL` | random per envelope | KEF envelope ID, also the PBKDF2 salt |
 | `--iterations N` | `1000000` | PBKDF2-HMAC-SHA256 iterations |
 | `--out FILE` | `kef_qr.png` | Output QR PNG path (refused if exists, unless `--force`) |
@@ -98,24 +104,28 @@ self-tested) is used because cryptography no longer ships RIPEMD-160.
    evenly distributed are **rejected** (shown by name) and skipped; the run
    continues if at least one photo passes. A warning fires when fewer than
    3 photos (or < 5 MB total) are accepted.
-3. **Prompt for the KEF password** (twice, via `getpass`) — before hashing, so
+3. **Stop if nothing passed** — if **every** photo is rejected, seed generation
+   is **stopped**: no seed is derived and no QR is written. This holds even
+   with CSPRNG mixing on — photo2seed never generates a seed without at least
+   one accepted photo. A clear message explains why and how to fix it.
+4. **Prompt for the KEF password** (twice, via `getpass`) — before hashing, so
    a mistyped confirmation does not waste the run.
-4. **SHA-512** each accepted photo (whole file, EXIF included).
-5. **Order** accepted photos by filename (natural sort), tie-break by digest.
-6. **Chain hash** = `SHA512( sha512(p₁) ‖ sha512(p₂) ‖ … )` over hex digests.
-7. **Mix OS CSPRNG** (default): `chain = SHA512( chain ‖ os.urandom(32) )`.
+5. **SHA-512** each accepted photo (whole file, EXIF included).
+6. **Order** accepted photos by filename (natural sort), tie-break by digest.
+7. **Chain hash** = `SHA512( sha512(p₁) ‖ sha512(p₂) ‖ … )` over hex digests.
+8. **Mix OS CSPRNG** (default): `chain = SHA512( chain ‖ os.urandom(32) )`.
    With `--no-mix-rng` this step is skipped.
-8. **BIP39 entropy** = first 16 bytes (12 words) or 32 bytes (24 words).
-9. **Words** — Ian Coleman method: SHA-256 checksum, 11-bit groups into the
-   vendored `english.txt` (SHA-256-verified against the official BIP39 list at
-   load time). Printed with BIP39 index numbers when `--show-words` is given.
-10. **XFP** (optional) — BIP32 master-key fingerprint of the derived seed.
-11. **KEF v20 (AES-GCM)** — plaintext is the entropy bytes; key =
+9. **BIP39 entropy** = first 16 bytes (12 words) or 32 bytes (24 words).
+10. **Words** — Ian Coleman method: SHA-256 checksum, 11-bit groups into the
+    vendored `english.txt` (SHA-256-verified against the official BIP39 list at
+    load time). Printed with BIP39 index numbers when `--show-words` is given.
+11. **XFP** (optional) — BIP32 master-key fingerprint of the derived seed.
+12. **KEF v20 (AES-GCM)** — plaintext is the entropy bytes; key =
     `pbkdf2_hmac_sha256(password, id, iterations)`; 12-byte random nonce; first
     4 bytes of the auth tag exposed; envelope = `len_id + id + 20 + iterations(3B)
     + nonce + ciphertext + tag`. A round-trip self-test decrypts the envelope
     before output.
-12. **QR** — base43-encode the envelope, render a PNG with the seed's XFP
+13. **QR** — base43-encode the envelope, render a PNG with the seed's XFP
     printed above the code and a label below it (custom `--label` or `KEF QR`).
 
 ## Determinism — two modes
@@ -225,6 +235,12 @@ seed, while the KEF password only protects the QR envelope.
 ## Security
 
 - Run on a trusted, ideally **airgapped**, machine.
+- **`--download-random` connects to the internet and uses PUBLIC photos**
+  (`picsum.photos`). Anyone who fetches the same picture gets identical bytes,
+  so this mode **forces CSPRNG mixing** — `--no-mix-rng` is rejected. The
+  downloaded photos add auxiliary entropy only; the OS CSPRNG (256 bits) is
+  what actually protects the seed. Prefer your own private, offline photos for
+  real wallets.
 - **The KEF password is the only secret protecting the QR**, and the envelope
   is designed for offline brute-force (PBKDF2 + 4-byte tag). Use a long random
   password (e.g. 6+ diceware words) and store it separately from the QR.

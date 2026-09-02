@@ -76,7 +76,18 @@ assert sum(1 for p in a.crop((0,h-45,w,h)).convert('L').getdata() if p < 128) > 
 os.remove(bare); os.remove(ann); print('OK bare', b.size, 'annotated', a.size)"; \
 	echo "== label >20 chars rejected =="; \
 	$$BIN --derive-only --label "012345678901234567890" /tmp/pk_test.png >/dev/null 2>&1 && { echo FAIL; exit 1; } || echo OK; \
-	rm -f /tmp/pk_test.png; \
+	echo "== download-random guards (offline, no network) =="; \
+	$$BIN --download-random --no-mix-rng /tmp/pk_test.png >/dev/null 2>&1 && { echo "FAIL: no-mix-rng+download accepted"; exit 1; } || echo "OK no-mix-rng rejected"; \
+	$$BIN --download-random 11 /tmp/pk_test.png >/dev/null 2>&1 && { echo "FAIL: count 11 accepted"; exit 1; } || echo "OK count 11 rejected"; \
+	$$BIN >/dev/null 2>&1 && { echo "FAIL: no source accepted"; exit 1; } || echo "OK no-source rejected"; \
+	$$BIN --help | grep -q -- "--download-random" && echo "OK flag in help"; \
+	echo "== no usable photo -> seed generation stopped (even with RNG) =="; \
+	$(VENV)/bin/python -c "from PIL import Image; Image.new('RGB',(256,256),(10,10,10)).save('/tmp/pk_flat.png')"; \
+	rm -f /tmp/pk_nope.png; \
+	$$BIN /tmp/pk_flat.png --force --out /tmp/pk_nope.png >/dev/null 2>&1 && { echo "FAIL: seed generated with no accepted photo"; exit 1; } || echo "OK rejected-photos run exited non-zero"; \
+	[ ! -f /tmp/pk_nope.png ] && echo "OK no QR written" || { echo "FAIL: QR written despite no accepted photo"; exit 1; }; \
+	$$BIN /tmp/pk_flat.png --force --out /tmp/pk_nope.png 2>&1 | grep -q "Seed generation STOPPED" && echo "OK clear stop message" || { echo "FAIL: missing stop message"; exit 1; }; \
+	rm -f /tmp/pk_test.png /tmp/pk_flat.png /tmp/pk_nope.png; \
 	echo "== all checks passed =="
 
 sha256:

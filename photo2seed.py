@@ -38,7 +38,10 @@ import math
 import os
 import re
 import sys
+import tempfile
+import time
 import unicodedata
+import urllib.request
 
 import qrcode
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -112,6 +115,37 @@ def collect_photos(paths):
             seen.add(real)
             uniq.append(f)
     return uniq
+
+
+PICSUM_URL = "https://picsum.photos/{w}/{h}?v={nonce}"
+
+
+def download_random_photos(count, out_dir, width=2000, height=1500):
+    """Download `count` random Picsum photos (JPEG) into `out_dir`.
+
+    Each request appends a unique nonce to bust the redirect/image cache, so a
+    fresh random picture is fetched every time. Returns the list of saved paths
+    (missing any that failed).
+    """
+    saved = []
+    for i in range(count):
+        url = PICSUM_URL.format(w=width, h=height, nonce=time.time_ns())
+        dest = os.path.join(out_dir, "random_%02d.jpg" % (i + 1))
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "photo2seed"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                if resp.status != 200 or not resp.headers.get("Content-Type", "").startswith("image/"):
+                    raise OSError("unexpected response: %s" % resp.status)
+                data = resp.read()
+            if not data:
+                raise OSError("empty body")
+            with open(dest, "wb") as f:
+                f.write(data)
+            print("  downloaded %-30s (%d KB)" % (os.path.basename(dest), len(data) // 1024))
+            saved.append(dest)
+        except Exception as exc:  # noqa: BLE001 - a failed download should not kill the run
+            print("[warn] download %d failed (%s); skipping" % (i + 1, exc), file=sys.stderr)
+    return saved
 
 
 # ---------------------------------------------------------------------------
@@ -542,6 +576,7 @@ def cmd_uninstall():
 EPILOG = """\
 examples:
   photo2seed ~/Pictures/trip/                  default: words -> KEF QR PNG + password
+  photo2seed --download-random                 fetch 10 random photos to /tmp, derive + QR
   photo2seed a.jpg some/dir/ --words 24        24-word seed
   photo2seed photos/ --show-words              also print words/entropy/hashes
   photo2seed photos/ --xfp                     also show master-key fingerprint (XFP)
@@ -572,7 +607,17 @@ def main():
         action="version",
         version="photo2seed %s (%s)" % (APP_VERSION, GITHUB_URL),
     )
-    ap.add_argument("paths", nargs="+", help="photo files and/or directories")
+    ap.add_argument("paths", nargs="*", help="photo files and/or directories (optional if --download-random)")
+    ap.add_argument(
+        "--download-random",
+        nargs="?",
+        type=int,
+        const=10,
+        default=None,
+        metavar="N",
+        help="fetch N random photos (default 10, max 10) to a fresh temp dir "
+        "in /tmp and use them as photo source; requires network",
+    )
     ap.add_argument(
         "--words",
         type=int,
@@ -649,6 +694,21 @@ def main():
     if args.label is not None and len(args.label) > 20:
         raise SystemExit("[fatal] --label must be 20 characters or fewer")
 
+    download_count = args.download_random
+    if download_count is not None:
+        if not 1 <= download_count <= 10:
+            raise SystemExit("[fatal] --download-random must be between 1 and 10")
+        if args.no_mix_rng:
+            raise SystemExit(
+                "[fatal] --download-random downloads PUBLIC photos; anyone "
+                "fetching the same picture would reproduce the seed under "
+                "--no-mix-rng. Remove --no-mix-rng (CSPRNG mixing is required)."
+            )
+    if not args.paths and download_count is None:
+        raise SystemExit(
+            "[fatal] no photo source: pass photo paths and/or --download-random"
+        )
+
     load_wordlist(resource_path("english.txt"))
 
     args.id = args.id or ("kef-photo-" + os.urandom(6).hex())
@@ -658,7 +718,13 @@ def main():
             "[fatal] output file %s already exists (use --force to overwrite)" % args.out
         )
 
-    photos = collect_photos(args.paths)
+    tmp_download_dir = None
+    if download_count is not None:
+        tmp_download_dir = tempfile.mkdtemp(prefix="photo2seed-", dir="/tmp")
+        print("\n== Downloading %d random photos to %s ==" % (download_count, tmp_download_dir))
+        download_random_photos(download_count, tmp_download_dir)
+
+    photos = collect_photos(list(args.paths) + ([tmp_download_dir] if tmp_download_dir else []))
     if not photos:
         print("[error] no photos found", file=sys.stderr)
         sys.exit(2)
@@ -681,7 +747,17 @@ def main():
             accepted.append(p)
 
     if not accepted:
-        print("[error] all photos rejected by the Shannon check", file=sys.stderr)
+        print(
+            "\n[error] No usable photo: every photo was rejected by the Shannon "
+            "quality check.\n"
+            "Seed generation STOPPED - nothing was derived and no QR was "
+            "written.\n"
+            "This holds even with CSPRNG mixing: photo2seed never generates a "
+            "seed without at least one accepted photo.\n"
+            "Use high-detail original photos (not flat/dark/re-compressed), or "
+            "lower --min-entropy / --min-brightness.",
+            file=sys.stderr,
+        )
         sys.exit(2)
 
     total_bytes = sum(os.path.getsize(p) for p in accepted)
@@ -798,6 +874,12 @@ def main():
         "Before funding: restore on Krux, verify the words (and XFP), and do "
         "one small receive + spend round-trip."
     )
+    if tmp_download_dir:
+        print(
+            "\nDownloaded photos kept in: %s\n"
+            "(random public images - the seed is protected by CSPRNG mixing, "
+            "not by these photos; delete the folder if you prefer)" % tmp_download_dir
+        )
 
 
 if __name__ == "__main__":
