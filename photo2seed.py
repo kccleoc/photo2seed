@@ -42,7 +42,7 @@ import unicodedata
 
 import qrcode
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from ripemd160 import ripemd160
 
@@ -439,13 +439,51 @@ def prompt_password():
 # ---------------------------------------------------------------------------
 
 
-def render_qr(data, out_path):
+def render_qr(data, out_path, top_text=None, bottom_text=None):
     qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=8, border=4)
     qr.add_data(data)
     qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
-    img.save(out_path)
-    print("QR saved: %s (%dx%d px)" % (out_path, img.size[0], img.size[1]))
+    qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    qr_w, qr_h = qr_img.size
+
+    font_top = ImageFont.load_default(size=34)
+    font_bottom = ImageFont.load_default(size=26)
+    pad_x, pad_y = 16, 12
+
+    def band_height(font):
+        ascent, descent = font.getmetrics()
+        return ascent + descent + 2 * pad_y
+
+    def text_width(draw, font, text):
+        bbox = draw.textbbox((0, 0), text, font=font)
+        return bbox[2] - bbox[0]
+
+    draw_probe = ImageDraw.Draw(qr_img)
+    top_h = band_height(font_top) if top_text else 0
+    bot_h = band_height(font_bottom) if bottom_text else 0
+    inner_w = max(qr_w, 2 * pad_x)
+    if top_text:
+        inner_w = max(inner_w, text_width(draw_probe, font_top, top_text) + 2 * pad_x)
+    if bottom_text:
+        inner_w = max(inner_w, text_width(draw_probe, font_bottom, bottom_text) + 2 * pad_x)
+
+    canvas = Image.new("RGB", (inner_w, top_h + qr_h + bot_h), "white")
+    canvas.paste(qr_img, ((inner_w - qr_w) // 2, top_h))
+    draw = ImageDraw.Draw(canvas)
+
+    def center(font, text, y):
+        bbox = draw.textbbox((0, 0), text, font=font)
+        ascent, _descent = font.getmetrics()
+        x = (inner_w - (bbox[2] - bbox[0])) // 2
+        draw.text((x, y + pad_y + ascent), text, font=font, fill="black")
+
+    if top_text:
+        center(font_top, top_text, 0)
+    if bottom_text:
+        center(font_bottom, bottom_text, top_h + qr_h)
+
+    canvas.save(out_path)
+    print("QR saved: %s (%dx%d px)" % (out_path, inner_w, top_h + qr_h + bot_h))
 
 
 # ---------------------------------------------------------------------------
@@ -555,6 +593,11 @@ def main():
         help="output QR PNG path (default kef_qr.png)",
     )
     ap.add_argument(
+        "--label",
+        default=None,
+        help="custom text printed under the QR (max 20 chars; default 'KEF QR')",
+    )
+    ap.add_argument(
         "--min-entropy",
         type=float,
         default=7.0,
@@ -599,6 +642,8 @@ def main():
         raise SystemExit("[fatal] --min-entropy must be between 0 and 8")
     if not 0 <= args.min_brightness <= 255:
         raise SystemExit("[fatal] --min-brightness must be between 0 and 255")
+    if args.label is not None and len(args.label) > 20:
+        raise SystemExit("[fatal] --label must be 20 characters or fewer")
 
     load_wordlist(resource_path("english.txt"))
 
@@ -691,8 +736,11 @@ def main():
     else:
         print("\nBIP39 words: [hidden - use --show-words to display]")
 
+    xfp = None
+    if args.xfp or not args.derive_only:
+        xfp = master_key_fingerprint(words)
     if args.xfp:
-        print("XFP: %s" % master_key_fingerprint(words))
+        print("XFP: %s" % xfp)
 
     if args.derive_only:
         if not args.no_mix_rng:
@@ -733,7 +781,12 @@ def main():
     for i in range(0, len(b43), 64):
         print("  %s" % b43[i : i + 64])
 
-    render_qr(b43, args.out)
+    render_qr(
+        b43,
+        args.out,
+        top_text="XFP: %s" % xfp,
+        bottom_text=args.label if args.label is not None else "KEF QR",
+    )
 
     print(
         "\nKrux recovery: load mnemonic -> QR Code; scan this QR; choose "

@@ -61,6 +61,21 @@ check:
 	W1=$$($$BIN --derive-only --show-words --no-mix-rng /tmp/pk_test.png 2>/dev/null | awk '/BIP39 words/{f=1} /^\[--derive-only\]/{f=0} f'); \
 	W2=$$($$BIN --derive-only --show-words --no-mix-rng /tmp/pk_test.png 2>/dev/null | awk '/BIP39 words/{f=1} /^\[--derive-only\]/{f=0} f'); \
 	[ "$$W1" = "$$W2" ] && [ -n "$$W1" ] && echo OK; \
+	echo "== QR annotation bands (top XFP + bottom label) =="; \
+	$(VENV)/bin/python -c "\
+from PIL import Image; \
+import photo2seed, tempfile, os; \
+bare = tempfile.mktemp(suffix='.png'); ann = tempfile.mktemp(suffix='.png'); \
+photo2seed.render_qr('TESTDATA', bare); \
+photo2seed.render_qr('TESTDATA', ann, top_text='XFP: 73C5DA0A', bottom_text='KEF QR'); \
+b = Image.open(bare); a = Image.open(ann); \
+assert a.size[1] > b.size[1], 'expected annotated QR taller than bare QR'; \
+h, w = a.size[1], a.size[0]; \
+assert sum(1 for p in a.crop((0,0,w,55)).convert('L').getdata() if p < 128) > 0, 'no top-band ink'; \
+assert sum(1 for p in a.crop((0,h-45,w,h)).convert('L').getdata() if p < 128) > 0, 'no bottom-band ink'; \
+os.remove(bare); os.remove(ann); print('OK bare', b.size, 'annotated', a.size)"; \
+	echo "== label >20 chars rejected =="; \
+	$$BIN --derive-only --label "012345678901234567890" /tmp/pk_test.png >/dev/null 2>&1 && { echo FAIL; exit 1; } || echo OK; \
 	rm -f /tmp/pk_test.png; \
 	echo "== all checks passed =="
 

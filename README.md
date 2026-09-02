@@ -50,6 +50,7 @@ photo2seed ~/Pictures/trip/                  # default: words -> KEF QR PNG + pa
 photo2seed a.jpg some/dir/ --words 24         # 24-word seed
 photo2seed photos/ --show-words              # also print words/entropy/hashes
 photo2seed photos/ --xfp                     # also show the master-key fingerprint
+photo2seed photos/ --label "Leo Vault #1"    # label under the QR (max 20 chars)
 photo2seed photos/ --derive-only --xfp       # show ONLY the XFP (no words, no KEF)
 photo2seed install / photo2seed uninstall    # add / remove the command
 ```
@@ -60,6 +61,7 @@ photo2seed install / photo2seed uninstall    # add / remove the command
 | `--id LABEL` | random per envelope | KEF envelope ID, also the PBKDF2 salt |
 | `--iterations N` | `1000000` | PBKDF2-HMAC-SHA256 iterations |
 | `--out FILE` | `kef_qr.png` | Output QR PNG path (refused if exists, unless `--force`) |
+| `--label TEXT` | `KEF QR` | Custom text printed under the QR (max 20 chars; reject if longer) |
 | `--show-words` | off | Print words, entropy, and SHA-512 digests |
 | `--xfp` | off | Print the master-key fingerprint (XFP) of the derived seed |
 | `--no-mix-rng` | off | Use photo entropy only (reproducible mode — see below) |
@@ -75,7 +77,9 @@ prints it as 8 uppercase hex chars, e.g. `XFP: 73C5DA0A`. It is a **public,
 non-secret identifier** — the same value shown by Krux, Specter, and most
 wallets — so it is printed even without `--show-words`. Use it to confirm that
 a wallet/Krux holds the same seed you generated, without exposing the words.
-Pair with `--derive-only` to show nothing else:
+The QR output always shows the XFP above the code (top band) so a printed
+backup identifies its seed at a glance. Pair with `--derive-only` to show
+nothing else:
 
 ```bash
 photo2seed photos/ --derive-only --xfp
@@ -111,7 +115,8 @@ self-tested) is used because cryptography no longer ships RIPEMD-160.
     4 bytes of the auth tag exposed; envelope = `len_id + id + 20 + iterations(3B)
     + nonce + ciphertext + tag`. A round-trip self-test decrypts the envelope
     before output.
-12. **QR** — base43-encode the envelope, render a PNG.
+12. **QR** — base43-encode the envelope, render a PNG with the seed's XFP
+    printed above the code and a label below it (custom `--label` or `KEF QR`).
 
 ## Determinism — two modes
 
@@ -171,6 +176,40 @@ disk; everything vanishes at shutdown. Seed material is not printed unless
 `--show-words` is passed, and `/tmp` output (the default `--out` location) is
 lost on reboot — copy the QR to persistent storage or a second USB stick in
 the same session.
+
+## Docker
+
+Run photo2seed in a disposable container: photos in, QR out, container gone.
+The `Dockerfile` builds a native image for your host architecture directly from
+source (no PyInstaller step needed), so it works on both arm64 (Apple Silicon)
+and amd64 without multi-arch emulation.
+
+Build once:
+
+```bash
+docker build -t photo2seed .
+```
+
+Run (container is removed automatically after the QR is written):
+
+```bash
+docker run --rm -it \
+  -v ~/photo:/photos:ro \
+  -v ~/kefout:/out \
+  photo2seed /photos --no-mix-rng --xfp --out /out/mykefQR.png
+```
+
+Notes:
+
+- **`-it`** is needed so you can type the KEF password interactively (`getpass`).
+- **Pass the directory, not a glob** — `docker run` does not expand `/photos/IMG*`
+  inside the container; `PATH...` accepts a directory and walks it recursively.
+- **Mount directories, not files** — Docker cannot bind-mount a non-existent
+  output file. The QR lands in `~/kefout/mykefQR.png`.
+- **`--rm`** deletes the container the instant it exits; nothing persists.
+- Input is mounted **read-only** (`:ro`). Output persists only in `~/kefout`.
+- Re-running needs `--force`, because the output file already exists on the host:
+  add `--force` before `--out`.
 
 ## Krux recovery
 
