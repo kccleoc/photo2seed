@@ -34,9 +34,13 @@ import argparse
 import getpass
 import hashlib
 import hmac
+import json
 import math
 import os
 import re
+import secrets
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -78,6 +82,21 @@ WORDLIST_SHA256 = "2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24d
 
 BIP39_WORDLIST = []
 
+# Memorable two-word lock folder name (human-readable, easy to recall)
+LOCK_WORDS_1 = (
+    "perch", "gaze", "calm", "bold", "swift", "bright", "quiet", "amber",
+    "river", "forest", "ocean", "sunset", "crisp", "lunar", "coral", "velvet",
+    "keen", "brave", "frost", "humble", "silent", "gold", "iron", "cedar",
+    "maple", "autumn", "crimson", "azure", "ember", "harbor", "meadow", "summit",
+)
+
+LOCK_WORDS_2 = (
+    "dog", "man", "owl", "fox", "wolf", "bear", "hawk", "stone", "light",
+    "pine", "dune", "ridge", "vale", "crest", "grove", "field", "shore", "peak",
+    "brook", "canyon", "falcon", "puma", "otter", "raven", "heron", "bison",
+    "elk", "seal", "wren", "lark", "finch", "thrush",
+)
+
 
 def resource_path(name):
     """Resolve a bundled data file, both as script and as PyInstaller binary."""
@@ -117,15 +136,284 @@ def collect_photos(paths):
     return uniq
 
 
+# ---------------------------------------------------------------------------
+# Photo lock — memorable folder + read-only seal
+# ---------------------------------------------------------------------------
+
+
+def generate_memorable_name():
+    """Return a human-readable two-word name like 'perch-dog' or 'gaze-man'."""
+    w1 = secrets.choice(LOCK_WORDS_1)
+    w2 = secrets.choice(LOCK_WORDS_2)
+    return f"{w1}-{w2}"
+
+
+def resolve_lock_dir(lock_arg, lock_dir_arg):
+    """Resolve --lock / --lock-dir into a concrete directory path or None."""
+    if lock_arg and lock_dir_arg:
+        raise SystemExit("[fatal] use only one of --lock or --lock-dir")
+    if lock_arg:
+        base = os.getcwd()
+        for _ in range(100):
+            name = generate_memorable_name()
+            candidate = os.path.join(base, name)
+            if not os.path.exists(candidate):
+                return candidate
+        # fallback: append nonce
+        return os.path.join(base, generate_memorable_name() + "-%d" % (time.time_ns() % 10000))
+    if lock_dir_arg is not None:
+        if not lock_dir_arg.strip():
+            raise SystemExit("[fatal] --lock-dir requires a non-empty path")
+        return lock_dir_arg
+    return None
+
+
+def clear_immutable(path):
+    """Best-effort clear immutable flag so file can be overwritten/removed."""
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["chflags", "nouchg", path], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        elif sys.platform.startswith("linux"):
+            subprocess.run(["chattr", "-i", path], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        # ensure writable for overwrite
+        mode = os.stat(path).st_mode
+        if not (mode & 0o200):
+            os.chmod(path, mode | 0o200)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def seal_readonly(path):
+    """Make file at path read-only (0444) and best-effort immutable; return (ok, note)."""
+    try:
+        os.chmod(path, 0o444)
+    except Exception as exc:  # noqa: BLE001
+        return False, "chmod failed: %s" % exc
+    # best-effort OS immutable bits (ignore failures - FAT32, permission, etc.)
+    note = ""
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["chflags", "uchg", path], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        elif sys.platform.startswith("linux"):
+            subprocess.run(["chattr", "+i", path], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+    except Exception:  # noqa: BLE001
+        pass
+    # verify chmod stuck (FAT32 may ignore)
+    try:
+        mode = os.stat(path).st_mode & 0o777
+        if mode & 0o222:
+            note = " (chmod ignored by filesystem)"
+    except Exception:  # noqa: BLE001
+        pass
+    return True, note
+
+
+def _is_subpath(child, parent):
+    """True if child is inside parent (both absolute)."""
+    try:
+        child_r = os.path.realpath(os.path.abspath(child))
+        parent_r = os.path.realpath(os.path.abspath(parent))
+        # child == parent is also considered subpath for exclusion
+        if child_r == parent_r:
+            return True
+        return os.path.commonpath([child_r, parent_r]) == parent_r
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def archive_pass_photos(accepted, digests_by_path, dest_dir, readonly=True, with_manifest=True):
+    """Copy PASS photos to dest_dir, seal read-only, write manifest.
+
+    accepted: list of source paths that passed Shannon.
+    digests_by_path: dict src -> sha512 hex (or bytes) for verification.
+    Returns (dest_paths, lock_dir) where dest_paths are the copied files.
+    """
+    # fail-fast if dest exists as file
+    if os.path.lexists(dest_dir) and not os.path.isdir(dest_dir):
+        raise SystemExit("[fatal] --lock-dir exists and is not a directory: %s" % dest_dir)
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+    except FileExistsError:
+        raise SystemExit("[fatal] --lock-dir exists and is not a directory: %s" % dest_dir)
+    except OSError as exc:  # noqa: BLE001
+        raise SystemExit("[fatal] cannot create lock dir %s (%s)" % (dest_dir, exc))
+    if not os.path.isdir(dest_dir):
+        raise SystemExit("[fatal] --lock-dir is not a directory: %s" % dest_dir)
+
+    dest_paths = []
+    manifest_entries = []
+    # existing files in dest_dir (for collision handling)
+    try:
+        existing = set(os.listdir(dest_dir))
+    except Exception:  # noqa: BLE001
+        existing = set()
+    seen_basenames = set(existing)
+
+    for src in accepted:
+        base = os.path.basename(src)
+        src_hex = digests_by_path.get(src)
+        if src_hex is None:
+            src_hex = sha512_file(src).hex()
+
+        dest_name = base
+        dst = os.path.join(dest_dir, dest_name)
+        # if file exists, check if byte-identical -> reuse instead of duplicate
+        if os.path.exists(dst):
+            try:
+                existing_hex = sha512_file(dst).hex()
+                if existing_hex == src_hex:
+                    # identical -> keep single copy, re-seal (clear uchg first then seal)
+                    if readonly:
+                        clear_immutable(dst)
+                    seen_basenames.add(dest_name)
+                    note = ""
+                    if readonly:
+                        _ok, note = seal_readonly(dst)
+                    dest_paths.append(dst)
+                    manifest_entries.append({
+                        "src": src,
+                        "dst_file": dest_name,
+                        "sha512": existing_hex,
+                        "readonly_note": note,
+                    })
+                    if readonly and note:
+                        print("[warn] %s chmod ignored (filesystem may not support permissions)" % dst, file=sys.stderr)
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
+            # hash differs or unreadable -> need collision suffix
+            if dest_name in seen_basenames:
+                stem, ext = os.path.splitext(base)
+                counter = 1
+                while True:
+                    candidate = f"{stem}__{counter}{ext}"
+                    cand_path = os.path.join(dest_dir, candidate)
+                    if candidate not in seen_basenames and not os.path.exists(cand_path):
+                        dest_name = candidate
+                        dst = cand_path
+                        break
+                    # if candidate exists and is identical, reuse it
+                    if os.path.exists(cand_path):
+                        try:
+                            cand_hex = sha512_file(cand_path).hex()
+                            if cand_hex == src_hex:
+                                if readonly:
+                                    clear_immutable(cand_path)
+                                seen_basenames.add(candidate)
+                                note = ""
+                                if readonly:
+                                    _ok, note = seal_readonly(cand_path)
+                                dest_paths.append(cand_path)
+                                manifest_entries.append({
+                                    "src": src,
+                                    "dst_file": candidate,
+                                    "sha512": cand_hex,
+                                    "readonly_note": note,
+                                })
+                                dest_name = None  # signal skip copy
+                                break
+                        except Exception:  # noqa: BLE001
+                            pass
+                    counter += 1
+                if dest_name is None:
+                    continue
+        elif dest_name in seen_basenames:
+            # name already used in this run (but file not on disk yet from earlier src in same run)
+            stem, ext = os.path.splitext(base)
+            counter = 1
+            while True:
+                candidate = f"{stem}__{counter}{ext}"
+                if candidate not in seen_basenames and not os.path.exists(os.path.join(dest_dir, candidate)):
+                    dest_name = candidate
+                    dst = os.path.join(dest_dir, candidate)
+                    break
+                counter += 1
+        seen_basenames.add(dest_name)
+        try:
+            # ensure dest's parent flags cleared before overwrite
+            if os.path.exists(dst):
+                clear_immutable(dst)
+            shutil.copy2(src, dst)
+        except Exception as exc:  # noqa: BLE001
+            print("[warn] lock copy failed %s -> %s (%s)" % (src, dst, exc), file=sys.stderr)
+            continue
+        # verify byte-identical via sha512
+        src_hex = digests_by_path.get(src)
+        if src_hex is None:
+            src_hex = sha512_file(src).hex()
+        try:
+            dst_hex = sha512_file(dst).hex()
+        except Exception as exc:  # noqa: BLE001
+            print("[warn] lock verify failed for %s (%s)" % (dst, exc), file=sys.stderr)
+            dst_hex = ""
+        if src_hex != dst_hex:
+            print("[warn] lock hash mismatch %s (src %s != dst %s)" % (dst, src_hex[:12], dst_hex[:12]), file=sys.stderr)
+        note = ""
+        if readonly:
+            _ok, note = seal_readonly(dst)
+        dest_paths.append(dst)
+        # manifest entry uses verified dst hash
+        manifest_entries.append({
+            "src": src,
+            "dst_file": dest_name,
+            "sha512": dst_hex or src_hex,
+            "readonly_note": note,
+        })
+        # quick check chmod stuck
+        if readonly and note:
+            print("[warn] %s chmod ignored (filesystem may not support permissions)" % dst, file=sys.stderr)
+
+    if with_manifest and manifest_entries:
+        # SHA512SUMS — fail-fast if cannot write (ENOSPC etc.)
+        sha_path = os.path.join(dest_dir, "SHA512SUMS")
+        if os.path.lexists(sha_path) and os.path.isdir(sha_path):
+            raise SystemExit("[fatal] cannot write SHA512SUMS (is directory): %s" % sha_path)
+        if os.path.exists(sha_path):
+            clear_immutable(sha_path)
+        try:
+            with open(sha_path, "w") as f:
+                for e in manifest_entries:
+                    f.write("%s  %s\n" % (e["sha512"], e["dst_file"]))
+        except OSError as exc:  # noqa: BLE001
+            raise SystemExit("[fatal] cannot write SHA512SUMS (%s)" % exc)
+        # manifest.json — privacy: store only dst_file+sha512, not absolute src
+        man_path = os.path.join(dest_dir, "manifest.json")
+        if os.path.lexists(man_path) and os.path.isdir(man_path):
+            raise SystemExit("[fatal] cannot write manifest.json (is directory): %s" % man_path)
+        if os.path.exists(man_path):
+            clear_immutable(man_path)
+        try:
+            # redact absolute src paths: keep only basename for privacy
+            safe_entries = [{"dst_file": e["dst_file"], "sha512": e["sha512"]} for e in manifest_entries]
+            manifest = {
+                "version": APP_VERSION,
+                "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "lock_dir": os.path.basename(os.path.abspath(dest_dir)),
+                "files": safe_entries,
+                "count": len(safe_entries),
+                "readonly": readonly,
+                "note": "Locked PASS photos — read-only copies. Re-derive with: photo2seed --no-mix-rng <lock_dir> (if created with --no-mix-rng) or photo2seed <lock_dir> (if CSPRNG-mixed, QR+password is backup).",
+            }
+            with open(man_path, "w") as f:
+                json.dump(manifest, f, indent=2)
+        except OSError as exc:  # noqa: BLE001
+            raise SystemExit("[fatal] cannot write manifest.json (%s)" % exc)
+
+    return dest_paths, os.path.abspath(dest_dir)
+
+
 PICSUM_URL = "https://picsum.photos/{w}/{h}?v={nonce}"
 
 
-def download_random_photos(count, out_dir, width=2000, height=1500):
+def download_random_photos(count, out_dir, width=2000, height=1500, max_bytes=10 * 1024 * 1024):
     """Download `count` random Picsum photos (JPEG) into `out_dir`.
 
     Each request appends a unique nonce to bust the redirect/image cache, so a
     fresh random picture is fetched every time. Returns the list of saved paths
-    (missing any that failed).
+    (missing any that failed). Caps read to max_bytes to avoid OOM.
     """
     saved = []
     for i in range(count):
@@ -136,9 +424,12 @@ def download_random_photos(count, out_dir, width=2000, height=1500):
             with urllib.request.urlopen(req, timeout=30) as resp:
                 if resp.status != 200 or not resp.headers.get("Content-Type", "").startswith("image/"):
                     raise OSError("unexpected response: %s" % resp.status)
-                data = resp.read()
+                # cap size to avoid decompression bomb / OOM
+                data = resp.read(max_bytes + 1)
             if not data:
                 raise OSError("empty body")
+            if len(data) > max_bytes:
+                raise OSError("response too large (%d > %d)" % (len(data), max_bytes))
             with open(dest, "wb") as f:
                 f.write(data)
             print("  downloaded %-30s (%d KB)" % (os.path.basename(dest), len(data) // 1024))
@@ -581,11 +872,17 @@ examples:
   photo2seed photos/ --show-words              also print words/entropy/hashes
   photo2seed photos/ --xfp                     also show master-key fingerprint (XFP)
   photo2seed photos/ --derive-only --xfp       show ONLY the XFP (no words, no KEF)
+  photo2seed photos/ --lock                    archive PASS photos to ./<word>-<word>/ read-only
+  photo2seed photos/ --lock-dir ./my-lock      archive PASS photos to ./my-lock/ read-only
   photo2seed install                           add 'photo2seed' to your user bin dir
   photo2seed uninstall                         remove the 'photo2seed' launcher
 
 KEF (v20 AES-GCM QR) output is ALWAYS the default. The KEF password is the
 only secret protecting the QR - use a long random password.
+Photo lock (--lock / --lock-dir) copies every PASS photo byte-identical into
+a folder, seals it read-only (0444, uchg/+i where supported), and writes
+SHA512SUMS + manifest.json so the folder re-derives deterministically with
+--no-mix-rng.
 
 GitHub: %s
 """ % GITHUB_URL
@@ -684,6 +981,27 @@ def main():
         action="store_true",
         help="overwrite the output QR file if it exists",
     )
+    ap.add_argument(
+        "--lock",
+        action="store_true",
+        help="archive PASS photos to a new memorable two-word folder (e.g. perch-dog) in cwd, sealed read-only (0444)",
+    )
+    ap.add_argument(
+        "--lock-dir",
+        default=None,
+        metavar="DIR",
+        help="archive PASS photos to DIR (existing or new), sealed read-only; mutually exclusive with --lock",
+    )
+    ap.add_argument(
+        "--no-readonly",
+        action="store_true",
+        help="when archiving with --lock/--lock-dir, keep copies writable (do not chmod 444)",
+    )
+    ap.add_argument(
+        "--no-manifest",
+        action="store_true",
+        help="when archiving, skip SHA512SUMS and manifest.json",
+    )
     args = ap.parse_args()
 
     validate_iterations(args.iterations)
@@ -693,6 +1011,8 @@ def main():
         raise SystemExit("[fatal] --min-brightness must be between 0 and 255")
     if args.label is not None and len(args.label) > 20:
         raise SystemExit("[fatal] --label must be 20 characters or fewer")
+    if (args.no_readonly or args.no_manifest) and not (args.lock or args.lock_dir):
+        print("[warn] --no-readonly/--no-manifest without --lock/--lock-dir has no effect", file=sys.stderr)
 
     download_count = args.download_random
     if download_count is not None:
@@ -718,13 +1038,66 @@ def main():
             "[fatal] output file %s already exists (use --force to overwrite)" % args.out
         )
 
+    # early lock validation before expensive work / password prompt
+    early_lock_dir = resolve_lock_dir(args.lock, args.lock_dir)
+    if early_lock_dir is not None:
+        if os.path.lexists(early_lock_dir) and not os.path.isdir(early_lock_dir):
+            raise SystemExit("[fatal] --lock-dir exists and is not a directory: %s" % early_lock_dir)
+        # reject lock_dir being inside any source path (would cause recursion next run)
+        abs_lock = os.path.abspath(early_lock_dir)
+        for src_p in args.paths:
+            if src_p and _is_subpath(abs_lock, os.path.abspath(src_p)):
+                raise SystemExit("[fatal] --lock-dir %s is inside source %s — would be re-collected next run" % (abs_lock, src_p))
+        # probe writability early (before password) without creating final lock dir if no PASS
+        try:
+            parent = os.path.dirname(abs_lock) or "."
+            if not os.path.isdir(parent):
+                raise OSError("parent not a directory: %s" % parent)
+            # check parent writable by probing parent, not creating empty lock dir
+            probe = os.path.join(parent, ".photo2seed_probe_%d" % (time.time_ns() % 1000000))
+            with open(probe, "w") as f:
+                f.write("probe")
+            os.remove(probe)
+        except OSError as exc:  # noqa: BLE001
+            raise SystemExit("[fatal] lock dir not writable %s (%s)" % (abs_lock, exc))
+        if not args.derive_only and _is_subpath(os.path.abspath(args.out), abs_lock):
+            print("[warn] --out %s is inside lock dir %s — QR will be inside lock and excluded from future collects" % (args.out, abs_lock), file=sys.stderr)
+
     tmp_download_dir = None
     if download_count is not None:
-        tmp_download_dir = tempfile.mkdtemp(prefix="photo2seed-", dir="/tmp")
+        tmp_download_dir = tempfile.mkdtemp(prefix="photo2seed-")
         print("\n== Downloading %d random photos to %s ==" % (download_count, tmp_download_dir))
         download_random_photos(download_count, tmp_download_dir)
 
-    photos = collect_photos(list(args.paths) + ([tmp_download_dir] if tmp_download_dir else []))
+    raw_photos = collect_photos(list(args.paths) + ([tmp_download_dir] if tmp_download_dir else []))
+    # exclude output QR and lock dir from being re-collected as photos
+    _exclude_roots = []
+    if not args.derive_only:
+        _exclude_roots.append(os.path.abspath(args.out))
+    if early_lock_dir is not None:
+        _exclude_roots.append(os.path.abspath(early_lock_dir))
+    if tmp_download_dir is not None:
+        # keep tmp for entropy but mark for lock exclusion later
+        pass
+    photos = []
+    for p in raw_photos:
+        ap = os.path.abspath(p)
+        skip = False
+        for ex in _exclude_roots:
+            if ap == ex or _is_subpath(ap, ex):
+                skip = True
+                break
+            # also exclude file == out path exactly
+            if ap == ex:
+                skip = True
+                break
+        # skip QR / manifest files that may live inside lock
+        if not skip and os.path.basename(p).lower() in ("sha512sums", "manifest.json"):
+            # only skip if inside lock_dir
+            if early_lock_dir is not None and _is_subpath(ap, os.path.abspath(early_lock_dir)):
+                skip = True
+        if not skip:
+            photos.append(p)
     if not photos:
         print("[error] no photos found", file=sys.stderr)
         sys.exit(2)
@@ -760,7 +1133,12 @@ def main():
         )
         sys.exit(2)
 
-    total_bytes = sum(os.path.getsize(p) for p in accepted)
+    total_bytes = 0
+    for p in accepted:
+        try:
+            total_bytes += os.path.getsize(p)
+        except OSError:  # noqa: BLE001 - file deleted between Shannon and sizing
+            pass
     if len(accepted) < 3 or total_bytes < 5 * 1024 * 1024:
         print(
             "[warn] thin entropy input: %d photo(s), %.1f MB total. "
@@ -781,6 +1159,48 @@ def main():
         print("\n== SHA-512 digest (ordered by filename, then digest) ==")
         for p, d in entries:
             print("  %-50s sha512=%s" % (os.path.basename(p), d.hex()))
+
+    # --- Photo lock: archive PASS photos read-only (before final so digests reusable) ---
+    # reuse early validation; early_lock_dir already probed before password
+    lock_dir = early_lock_dir
+    if lock_dir is not None:
+        # exclude downloaded public photos from deterministic lock
+        lock_accepted = accepted
+        if tmp_download_dir is not None:
+            tmp_abs = os.path.abspath(tmp_download_dir)
+            filtered = [p for p in accepted if not _is_subpath(os.path.abspath(p), tmp_abs)]
+            if len(filtered) != len(accepted):
+                print("[warn] --download-random photos are public and excluded from lock (CSPRNG protects seed)" , file=sys.stderr)
+            lock_accepted = filtered
+            if not lock_accepted:
+                print("[warn] no private PASS photos to lock after excluding --download-random", file=sys.stderr)
+        if lock_accepted:
+            digests_by_path = {p: d.hex() for p, d in entries if p in set(lock_accepted)}
+            # ensure digests for filtered still available
+            for p in lock_accepted:
+                if p not in digests_by_path:
+                    digests_by_path[p] = sha512_file(p).hex()
+            readonly = not args.no_readonly
+            with_manifest = not args.no_manifest
+            print("\n== Photo lock ==")
+            print("  Lock dir: %s" % os.path.abspath(lock_dir))
+            if not args.no_mix_rng:
+                print("  [warn] CSPRNG mixing is ON: lock copies alone are NOT sufficient for re-derive; keep QR+password as backup (use --no-mix-rng for deterministic lock)" , file=sys.stderr)
+            # fail-fast: any lock error aborts before seed derivation is considered reproducible
+            dest_paths, abs_lock = archive_pass_photos(
+                lock_accepted, digests_by_path, lock_dir, readonly=readonly, with_manifest=with_manifest
+            )
+            print("  Archived %d PASS photo(s) -> %s" % (len(dest_paths), abs_lock))
+            if readonly:
+                print("  Sealed read-only (0444, uchg/+i where supported)")
+            else:
+                print("  Kept writable (--no-readonly)")
+            if with_manifest:
+                print("  Manifest: SHA512SUMS + manifest.json")
+            if args.no_mix_rng:
+                print("  Re-derive deterministically: photo2seed --no-mix-rng --show-words \"%s\"" % abs_lock)
+            else:
+                print("  Re-derive deterministically only if created with --no-mix-rng; otherwise QR+password is backup: photo2seed --show-words \"%s\" (will derive different words)" % abs_lock)
 
     final = final_chain_hash([d for _, d in entries])
     if args.show_words:
