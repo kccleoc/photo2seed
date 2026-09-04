@@ -50,14 +50,16 @@ Examples:
 
 ```bash
 photo2seed ~/Pictures/trip/                  # default: words -> KEF QR PNG + password
-photo2seed --download-random                 # fetch 10 random photos to /tmp, then derive
-photo2seed --download-random 3 ~/own/         # 3 random photos + your own folder
+photo2seed --download-random                 # fetch 10 random photos to /tmp, then derive (standalone)
+photo2seed ./myseedphoto --add-download-random 10  # mix 10 random /tmp photos with ./myseedphoto (requires PATH)
 photo2seed a.jpg some/dir/ --words 24         # 24-word seed
 photo2seed photos/ --show-words              # also print words/entropy/hashes
 photo2seed photos/ --xfp                     # also show the master-key fingerprint
 photo2seed photos/ --label "Leo Vault #1"    # label under the QR (max 20 chars)
-photo2seed photos/ --lock                    # archive PASS photos to ./<word>-<word>/ read-only
-photo2seed photos/ --lock-dir ./vault --no-mix-rng --show-words  # deterministic lock + verify
+photo2seed photos/ --lock                    # archive PASS photos to ./<word>-<word>/ read-only (PASS only, REJECT excluded)
+photo2seed photos/ --lock-dir ./vault --no-mix-rng --show-words  # deterministic lock + verify (PASS only)
+photo2seed ./myseedphoto --add-download-random 5 --burn  # mix 5 random, then burn /tmp/photo2seed-* after derivation
+photo2seed --purge-temp --yes               # purge all temp /tmp and /var/folders photo2seed folders without confirmation
 photo2seed photos/ --derive-only --xfp       # show ONLY the XFP (no words, no KEF)
 photo2seed install / photo2seed uninstall    # add / remove the command
 ```
@@ -79,8 +81,10 @@ photo2seed install / photo2seed uninstall    # add / remove the command
 | `--lock-dir DIR` | off | Archive PASS photos to `DIR` (existing or new), sealed read-only; mutually exclusive with `--lock` |
 | `--no-readonly` | off | With `--lock`/`--lock-dir`, keep copies writable (do not `chmod 444`) |
 | `--no-manifest` | off | With `--lock`/`--lock-dir`, skip `SHA512SUMS` and `manifest.json` |
+| `--add-download-random [N]` | off | Fetch N random photos (1-10, default 10) to `/tmp` and MIX with PATH photos; requires PATH; cannot combine with `--download-random` or `--no-mix-rng`; contradictory with `--burn` |
+| `--burn` | off | After derivation delete the `/tmp/photo2seed-*` dir created for this run (requires `--download-random` or `--add-download-random`; mutually exclusive with `--purge-temp`) |
 | `--purge-temp` / `purge` | off | Find temp folders (`photo2seed-` in `/tmp` and `/var/folders`) and offer to purge with confirmation |
-| `-y` / `--yes` | off | With `--purge-temp`/`purge`, purge without confirmation |
+| `-y` / `--yes` | off | With `--purge-temp`/`purge`, purge without confirmation (not `--force`) |
 | `--min-entropy BITS` | `7.0` | Reject photos with Shannon entropy below this |
 | `--min-brightness 0-255` | `30.0` | Reject photos with mean brightness below this |
 

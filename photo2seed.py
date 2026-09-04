@@ -1026,11 +1026,13 @@ EPILOG = """\
 examples:
   photo2seed ~/Pictures/trip/                  default: words -> KEF QR PNG + password
   photo2seed --download-random                 fetch 10 random photos to /tmp, derive + QR (stored in system /tmp, not /var/folders)
+  photo2seed ./myseedphoto --add-download-random 10  mix 10 random /tmp photos with ./myseedphoto (requires PATH)
+  photo2seed ./myseedphoto --add-download-random 5 --burn  mix 5 random then burn /tmp/photo2seed-* after derivation (contradicts purge)
   photo2seed a.jpg some/dir/ --words 24        24-word seed
   photo2seed photos/ --show-words              also print words/entropy/hashes
   photo2seed photos/ --xfp                     also show master-key fingerprint (XFP)
   photo2seed photos/ --derive-only --xfp       show ONLY the XFP (no words, no KEF)
-  photo2seed photos/ --lock                    archive PASS photos to ./<word>-<word>/ read-only
+  photo2seed photos/ --lock                    archive PASS photos to ./<word>-<word>/ read-only (PASS only, REJECT excluded)
   photo2seed photos/ --lock-dir ./my-lock      archive PASS photos to ./my-lock/ read-only
   photo2seed --purge-temp                      find temp photo2seed folders in /tmp and /var/folders and purge with confirmation
   photo2seed purge --yes                       same as --purge-temp --yes
@@ -1042,8 +1044,8 @@ only secret protecting the QR - use a long random password.
 Photo lock (--lock / --lock-dir) copies every PASS photo byte-identical into
 a folder, seals it read-only (0444, uchg/+i where supported), and writes
 SHA512SUMS + manifest.json so the folder re-derives deterministically with
---no-mix-rng.
-Temp handling: all temp folders use system temp /tmp (not /var/folders); --purge-temp scans /tmp, $TMPDIR and /var/folders for photo2seed- folders.
+--no-mix-rng (REJECT excluded).
+Temp handling: all temp folders use system temp /tmp (not /var/folders); --purge-temp scans /tmp, $TMPDIR and /var/folders for photo2seed- folders; --burn deletes the current run's /tmp/photo2seed-* after success or Shannon fail.
 
 GitHub: %s
 """ % GITHUB_URL
@@ -1053,12 +1055,14 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] in ("install", "uninstall"):
         (cmd_install if sys.argv[1] == "install" else cmd_uninstall)()
         return
+    if "--burn" in sys.argv and any(x in sys.argv for x in ("purge", "purge-temp", "clean-temp", "--purge-temp")):
+        raise SystemExit("[fatal] --burn and --purge-temp are mutually exclusive (burn is per-run, purge-temp is global)")
     if len(sys.argv) > 1 and sys.argv[1] in ("purge", "purge-temp", "clean-temp"):
         # don't swallow --help
         if "--help" in sys.argv or "-h" in sys.argv:
             pass  # fall through to argparse help
         else:
-            force = "--force" in sys.argv or "--yes" in sys.argv or "-y" in sys.argv
+            force = "--yes" in sys.argv or "-y" in sys.argv
             cmd_purge_temp(force=force)
             return
 
@@ -1082,7 +1086,21 @@ def main():
         default=None,
         metavar="N",
         help="fetch N random photos (default 10, max 10) to a fresh temp dir "
-        "in /tmp and use them as photo source; requires network",
+        "in /tmp and use them as photo source; requires network; standalone (use --add-download-random to mix with PATH)",
+    )
+    ap.add_argument(
+        "--add-download-random",
+        nargs="?",
+        type=int,
+        const=10,
+        default=None,
+        metavar="N",
+        help="fetch N random photos (1-10, default 10) to /tmp and MIX with PATH photos; requires at least one PATH (e.g. photo2seed ./myseedphoto --add-download-random 10)",
+    )
+    ap.add_argument(
+        "--burn",
+        action="store_true",
+        help="after derivation delete the /tmp/photo2seed-* dir created for this run (requires --download-random or --add-download-random)",
     )
     ap.add_argument(
         "--words",
@@ -1184,8 +1202,10 @@ def main():
     )
     args = ap.parse_args()
 
+    if args.burn and args.purge_temp:
+        raise SystemExit("[fatal] --burn and --purge-temp are mutually exclusive (burn is per-run, purge-temp is global)")
     if args.purge_temp:
-        cmd_purge_temp(force=args.yes or args.force)
+        cmd_purge_temp(force=args.yes)
         return
 
     validate_iterations(args.iterations)
@@ -1198,7 +1218,19 @@ def main():
     if (args.no_readonly or args.no_manifest) and not (args.lock or args.lock_dir):
         print("[warn] --no-readonly/--no-manifest without --lock/--lock-dir has no effect", file=sys.stderr)
 
+    # --- contradiction guards ---
+    if args.download_random is not None and args.add_download_random is not None:
+        raise SystemExit("[fatal] use only one of --download-random or --add-download-random")
+    if args.burn and args.purge_temp:
+        raise SystemExit("[fatal] --burn and --purge-temp are mutually exclusive (burn is per-run, purge-temp is global)")
+    if args.burn and args.add_download_random is not None:
+        raise SystemExit("[fatal] --burn and --add-download-random are contradictory (burn would delete the just-added random photos immediately after use)")
+    # burn requires a temp download to burn
+    if args.burn and args.download_random is None and args.add_download_random is None:
+        raise SystemExit("[fatal] --burn requires --download-random or --add-download-random (nothing to burn)")
+
     download_count = args.download_random
+    add_download_count = args.add_download_random
     if download_count is not None:
         if not 1 <= download_count <= 10:
             raise SystemExit("[fatal] --download-random must be between 1 and 10")
@@ -1208,9 +1240,22 @@ def main():
                 "fetching the same picture would reproduce the seed under "
                 "--no-mix-rng. Remove --no-mix-rng (CSPRNG mixing is required)."
             )
-    if not args.paths and download_count is None:
+    if add_download_count is not None:
+        if not 1 <= add_download_count <= 10:
+            raise SystemExit("[fatal] --add-download-random must be between 1 and 10")
+        if not args.paths:
+            raise SystemExit("[fatal] --add-download-random requires at least one PATH (e.g. photo2seed ./myseedphoto --add-download-random 10)")
+        if args.no_mix_rng:
+            raise SystemExit(
+                "[fatal] --add-download-random downloads PUBLIC photos; anyone "
+                "fetching the same picture would reproduce the seed under "
+                "--no-mix-rng. Remove --no-mix-rng (CSPRNG mixing is required)."
+            )
+    effective_download_count = download_count if download_count is not None else add_download_count
+    has_download = effective_download_count is not None
+    if not args.paths and not has_download:
         raise SystemExit(
-            "[fatal] no photo source: pass photo paths and/or --download-random"
+            "[fatal] no photo source: pass photo paths and/or --download-random / --add-download-random"
         )
 
     load_wordlist(resource_path("english.txt"))
@@ -1248,10 +1293,22 @@ def main():
             print("[warn] --out %s is inside lock dir %s — QR will be inside lock and excluded from future collects" % (args.out, abs_lock), file=sys.stderr)
 
     tmp_download_dir = None
-    if download_count is not None:
+    if has_download:
         tmp_download_dir = tempfile.mkdtemp(prefix="photo2seed-", dir=get_system_temp_dir())
-        print("\n== Downloading %d random photos to %s ==" % (download_count, tmp_download_dir))
-        download_random_photos(download_count, tmp_download_dir)
+        print("\n== Downloading %d random photos to %s ==" % (effective_download_count, tmp_download_dir))
+        saved = download_random_photos(effective_download_count, tmp_download_dir)
+        if not saved:
+            print("[warn] no random photos downloaded (network issue); continuing with PATH photos only" if args.paths else "[error] no random photos downloaded and no PATH photos", file=sys.stderr)
+            if not args.paths:
+                if tmp_download_dir and args.burn:
+                    try:
+                        shutil.rmtree(tmp_download_dir)
+                        print("\nBurned temp photos: %s" % tmp_download_dir)
+                    except Exception as exc:  # noqa: BLE001
+                        print("[warn] burn failed %s (%s)" % (tmp_download_dir, exc), file=sys.stderr)
+                raise SystemExit(2)
+        elif len(saved) < effective_download_count:
+            print("[warn] only %d/%d random photos downloaded" % (len(saved), effective_download_count), file=sys.stderr)
 
     raw_photos = collect_photos(list(args.paths) + ([tmp_download_dir] if tmp_download_dir else []))
     # exclude output QR and lock dir from being re-collected as photos
@@ -1284,6 +1341,12 @@ def main():
             photos.append(p)
     if not photos:
         print("[error] no photos found", file=sys.stderr)
+        if tmp_download_dir and args.burn:
+            try:
+                shutil.rmtree(tmp_download_dir)
+                print("\nBurned temp photos: %s" % tmp_download_dir)
+            except Exception as exc:  # noqa: BLE001
+                print("[warn] burn failed %s (%s)" % (tmp_download_dir, exc), file=sys.stderr)
         sys.exit(2)
 
     print("== Photo Shannon quality check ==")
@@ -1315,6 +1378,12 @@ def main():
             "lower --min-entropy / --min-brightness.",
             file=sys.stderr,
         )
+        if tmp_download_dir and args.burn:
+            try:
+                shutil.rmtree(tmp_download_dir)
+                print("\nBurned temp photos: %s" % tmp_download_dir)
+            except Exception as exc:  # noqa: BLE001
+                print("[warn] burn failed %s (%s)" % (tmp_download_dir, exc), file=sys.stderr)
         sys.exit(2)
 
     total_bytes = 0
@@ -1435,6 +1504,18 @@ def main():
             )
         else:
             print("\n[--derive-only] No KEF envelope or QR written.")
+        if tmp_download_dir and args.burn:
+            try:
+                shutil.rmtree(tmp_download_dir)
+                print("\nBurned temp photos: %s" % tmp_download_dir)
+            except Exception as exc:  # noqa: BLE001
+                print("[warn] burn failed %s (%s)" % (tmp_download_dir, exc), file=sys.stderr)
+        elif tmp_download_dir:
+            print(
+                "\nDownloaded photos kept in: %s\n"
+                "(random public images - the seed is protected by CSPRNG mixing, "
+                "not by these photos; delete the folder if you prefer - use --burn to auto-delete)" % tmp_download_dir
+            )
         return
 
     # --- KEF encrypt (v20 AES-GCM) ---
@@ -1449,9 +1530,21 @@ def main():
     back = kef_decrypt_gcm(derived, payload2)
     if back != plaintext:
         print("[error] KEF round-trip self-test FAILED", file=sys.stderr)
+        if tmp_download_dir and args.burn:
+            try:
+                shutil.rmtree(tmp_download_dir)
+                print("\nBurned temp photos: %s" % tmp_download_dir)
+            except Exception as exc:  # noqa: BLE001
+                print("[warn] burn failed %s (%s)" % (tmp_download_dir, exc), file=sys.stderr)
         sys.exit(3)
     if base43_decode(base43_encode(envelope)) != envelope:
         print("[error] base43 round-trip self-test FAILED", file=sys.stderr)
+        if tmp_download_dir and args.burn:
+            try:
+                shutil.rmtree(tmp_download_dir)
+                print("\nBurned temp photos: %s" % tmp_download_dir)
+            except Exception as exc:  # noqa: BLE001
+                print("[warn] burn failed %s (%s)" % (tmp_download_dir, exc), file=sys.stderr)
         sys.exit(3)
 
     print("\n== KEF envelope ==")
@@ -1479,11 +1572,18 @@ def main():
         "one small receive + spend round-trip."
     )
     if tmp_download_dir:
-        print(
-            "\nDownloaded photos kept in: %s\n"
-            "(random public images - the seed is protected by CSPRNG mixing, "
-            "not by these photos; delete the folder if you prefer)" % tmp_download_dir
-        )
+        if args.burn:
+            try:
+                shutil.rmtree(tmp_download_dir)
+                print("\nBurned temp photos: %s" % tmp_download_dir)
+            except Exception as exc:  # noqa: BLE001
+                print("[warn] burn failed %s (%s)" % (tmp_download_dir, exc), file=sys.stderr)
+        else:
+            print(
+                "\nDownloaded photos kept in: %s\n"
+                "(random public images - the seed is protected by CSPRNG mixing, "
+                "not by these photos; delete the folder if you prefer - use --burn to auto-delete)" % tmp_download_dir
+            )
 
 
 if __name__ == "__main__":
