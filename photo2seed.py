@@ -104,6 +104,20 @@ def resource_path(name):
     return os.path.join(base, name)
 
 
+def get_system_temp_dir():
+    """Return system temp dir, always /tmp on POSIX (not /var/folders), fallback to tempfile.gettempdir."""
+    if sys.platform == "win32":
+        return os.environ.get("TEMP") or os.environ.get("TMP") or tempfile.gettempdir()
+    # POSIX: prefer /tmp (and /private/tmp on macOS) over $TMPDIR (/var/folders)
+    for cand in ("/tmp", "/private/tmp"):
+        if os.path.isdir(cand) and os.access(cand, os.W_OK):
+            return cand
+    return tempfile.gettempdir()
+
+
+SYSTEM_TEMP = get_system_temp_dir()  # evaluated at import for legacy; prefer get_system_temp_dir() live
+
+
 # ---------------------------------------------------------------------------
 # Path / photo discovery
 # ---------------------------------------------------------------------------
@@ -153,7 +167,7 @@ def resolve_lock_dir(lock_arg, lock_dir_arg):
     if lock_arg and lock_dir_arg:
         raise SystemExit("[fatal] use only one of --lock or --lock-dir")
     if lock_arg:
-        base = os.getcwd()
+        base = os.getcwd()  # durable archive should stay in cwd, not /tmp (purged on reboot)
         for _ in range(100):
             name = generate_memorable_name()
             candidate = os.path.join(base, name)
@@ -403,6 +417,150 @@ def archive_pass_photos(accepted, digests_by_path, dest_dir, readonly=True, with
             raise SystemExit("[fatal] cannot write manifest.json (%s)" % exc)
 
     return dest_paths, os.path.abspath(dest_dir)
+
+
+def find_temp_photo_folders():
+    """Search system temp and macOS /var for photo2seed temp folders.
+
+    Returns sorted list of (path, file_count, total_bytes).
+    Searches: /tmp (realpath), tempfile.gettempdir() (often /var/folders/.../T), $TMPDIR, /var/folders (limited).
+    Matches prefix photo2seed-.
+    """
+    raw_roots = set()
+    try:
+        raw_roots.add(os.path.abspath(get_system_temp_dir()))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        raw_roots.add(os.path.abspath(tempfile.gettempdir()))
+    except Exception:  # noqa: BLE001
+        pass
+    tmpdir_env = os.environ.get("TMPDIR", "").strip()
+    if tmpdir_env:
+        try:
+            raw_roots.add(os.path.abspath(tmpdir_env.rstrip("/")))
+        except Exception:  # noqa: BLE001
+            pass
+    # include /var/folders as extra root on macOS to catch legacy dirs
+    if sys.platform == "darwin" and os.path.isdir("/var/folders"):
+        raw_roots.add(os.path.abspath("/var/folders"))
+    if os.path.isdir("/private/tmp"):
+        raw_roots.add(os.path.abspath("/private/tmp"))
+    # dedup via realpath (handles /tmp -> /private/tmp)
+    roots = set()
+    for r in raw_roots:
+        if not r or not os.path.isdir(r):
+            continue
+        try:
+            roots.add(os.path.realpath(r))
+        except Exception:  # noqa: BLE001
+            roots.add(r)
+
+    candidates = {}
+    for root in sorted(roots):
+        if not os.path.isdir(root):
+            continue
+        # use realpath for root comparison
+        real_root = os.path.realpath(root)
+        for dirpath, dirnames, filenames in os.walk(real_root, topdown=True, onerror=lambda e: None, followlinks=False):
+            # limit depth for /var/folders to avoid huge scan
+            if os.path.basename(real_root) == "folders" and "var" in real_root:
+                # real_root is /private/var/folders or /var/folders
+                depth = dirpath[len(real_root):].count(os.sep)
+                if depth > 4:
+                    dirnames[:] = []
+                    continue
+                # prune branches that cannot contain photo2seed- without T
+                # keep walk simple but skip obvious non-T at depth 1-2 quickly
+                # not pruning aggressively to keep correctness
+            base = os.path.basename(dirpath)
+            if base.startswith("photo2seed-"):
+                real_path = os.path.realpath(dirpath)
+                if real_path not in candidates:
+                    try:
+                        total = 0
+                        count = 0
+                        for dp, _, fns in os.walk(dirpath, followlinks=False):
+                            for fn in fns:
+                                fp = os.path.join(dp, fn)
+                                try:
+                                    total += os.path.getsize(fp)
+                                    count += 1
+                                except OSError:
+                                    pass
+                        candidates[real_path] = (count, total)
+                    except Exception:  # noqa: BLE001
+                        candidates[real_path] = (0, 0)
+                    dirnames[:] = []
+                    continue
+
+    result = []
+    for p in sorted(candidates.keys()):
+        c, t = candidates[p]
+        result.append((p, c, t))
+    return result
+
+
+def cmd_purge_temp(force=False):
+    """Find and optionally purge temp photo folders, with confirmation."""
+    folders = find_temp_photo_folders()
+    if not folders:
+        print("No photo2seed temp folders found in:")
+        for r in sorted({os.path.realpath(get_system_temp_dir()), os.path.realpath(tempfile.gettempdir()), os.path.realpath(os.environ.get("TMPDIR","").strip()) if os.environ.get("TMPDIR","").strip() else ""}):
+            if r:
+                print("  %s" % r)
+        if sys.platform == "darwin":
+            print("  /var/folders (scanned limited depth, realpath /private/var/folders)")
+        return
+    print("Found %d photo2seed temp folder(s):" % len(folders))
+    for p, cnt, tot in folders:
+        print("  %-60s %3d files  %6.1f MB" % (p, cnt, tot / (1024 * 1024)))
+    if not force:
+        try:
+            resp = input("Purge these folders? [y/N] ")
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.")
+            return
+        if resp.strip().lower() not in ("y", "yes"):
+            print("Aborted.")
+            return
+    # purge — batch clear immutable where possible
+    failed = []
+    for p, _, _ in folders:
+        try:
+            # batch clear immutable (darwin/linux) once per folder
+            if sys.platform == "darwin":
+                subprocess.run(["chflags", "-R", "nouchg", p], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+            elif sys.platform.startswith("linux"):
+                subprocess.run(["chattr", "-R", "-i", p], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+            # fallback per-file clear + chmod for stubborn cases / FAT
+            for dirpath, dirnames, filenames in os.walk(p, topdown=False, followlinks=False):
+                for fn in filenames:
+                    fp = os.path.join(dirpath, fn)
+                    # already batch-cleared, just ensure writable
+                    try:
+                        os.chmod(fp, 0o644)
+                    except OSError:
+                        pass
+                for dn in dirnames:
+                    dp = os.path.join(dirpath, dn)
+                    try:
+                        os.chmod(dp, 0o755)
+                    except OSError:
+                        pass
+            try:
+                os.chmod(p, 0o755)
+            except OSError:
+                pass
+            shutil.rmtree(p)
+            print("Purged: %s" % p)
+        except Exception as exc:  # noqa: BLE001
+            print("[warn] failed to purge %s (%s)" % (p, exc), file=sys.stderr)
+            failed.append(p)
+    if failed:
+        print("[warn] %d folder(s) failed to purge" % len(failed), file=sys.stderr)
+    else:
+        print("Done.")
 
 
 PICSUM_URL = "https://picsum.photos/{w}/{h}?v={nonce}"
@@ -867,13 +1025,15 @@ def cmd_uninstall():
 EPILOG = """\
 examples:
   photo2seed ~/Pictures/trip/                  default: words -> KEF QR PNG + password
-  photo2seed --download-random                 fetch 10 random photos to /tmp, derive + QR
+  photo2seed --download-random                 fetch 10 random photos to /tmp, derive + QR (stored in system /tmp, not /var/folders)
   photo2seed a.jpg some/dir/ --words 24        24-word seed
   photo2seed photos/ --show-words              also print words/entropy/hashes
   photo2seed photos/ --xfp                     also show master-key fingerprint (XFP)
   photo2seed photos/ --derive-only --xfp       show ONLY the XFP (no words, no KEF)
   photo2seed photos/ --lock                    archive PASS photos to ./<word>-<word>/ read-only
   photo2seed photos/ --lock-dir ./my-lock      archive PASS photos to ./my-lock/ read-only
+  photo2seed --purge-temp                      find temp photo2seed folders in /tmp and /var/folders and purge with confirmation
+  photo2seed purge --yes                       same as --purge-temp --yes
   photo2seed install                           add 'photo2seed' to your user bin dir
   photo2seed uninstall                         remove the 'photo2seed' launcher
 
@@ -883,6 +1043,7 @@ Photo lock (--lock / --lock-dir) copies every PASS photo byte-identical into
 a folder, seals it read-only (0444, uchg/+i where supported), and writes
 SHA512SUMS + manifest.json so the folder re-derives deterministically with
 --no-mix-rng.
+Temp handling: all temp folders use system temp /tmp (not /var/folders); --purge-temp scans /tmp, $TMPDIR and /var/folders for photo2seed- folders.
 
 GitHub: %s
 """ % GITHUB_URL
@@ -892,6 +1053,14 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] in ("install", "uninstall"):
         (cmd_install if sys.argv[1] == "install" else cmd_uninstall)()
         return
+    if len(sys.argv) > 1 and sys.argv[1] in ("purge", "purge-temp", "clean-temp"):
+        # don't swallow --help
+        if "--help" in sys.argv or "-h" in sys.argv:
+            pass  # fall through to argparse help
+        else:
+            force = "--force" in sys.argv or "--yes" in sys.argv or "-y" in sys.argv
+            cmd_purge_temp(force=force)
+            return
 
     ap = argparse.ArgumentParser(
         prog="photo2seed",
@@ -1002,7 +1171,22 @@ def main():
         action="store_true",
         help="when archiving, skip SHA512SUMS and manifest.json",
     )
+    ap.add_argument(
+        "--purge-temp",
+        action="store_true",
+        help="find temp folders (photo2seed- in /tmp and /var/folders) and offer to purge with confirmation",
+    )
+    ap.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="with --purge-temp, purge without confirmation",
+    )
     args = ap.parse_args()
+
+    if args.purge_temp:
+        cmd_purge_temp(force=args.yes or args.force)
+        return
 
     validate_iterations(args.iterations)
     if not 0 <= args.min_entropy <= 8:
@@ -1065,7 +1249,7 @@ def main():
 
     tmp_download_dir = None
     if download_count is not None:
-        tmp_download_dir = tempfile.mkdtemp(prefix="photo2seed-")
+        tmp_download_dir = tempfile.mkdtemp(prefix="photo2seed-", dir=get_system_temp_dir())
         print("\n== Downloading %d random photos to %s ==" % (download_count, tmp_download_dir))
         download_random_photos(download_count, tmp_download_dir)
 

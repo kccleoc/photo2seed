@@ -79,6 +79,8 @@ photo2seed install / photo2seed uninstall    # add / remove the command
 | `--lock-dir DIR` | off | Archive PASS photos to `DIR` (existing or new), sealed read-only; mutually exclusive with `--lock` |
 | `--no-readonly` | off | With `--lock`/`--lock-dir`, keep copies writable (do not `chmod 444`) |
 | `--no-manifest` | off | With `--lock`/`--lock-dir`, skip `SHA512SUMS` and `manifest.json` |
+| `--purge-temp` / `purge` | off | Find temp folders (`photo2seed-` in `/tmp` and `/var/folders`) and offer to purge with confirmation |
+| `-y` / `--yes` | off | With `--purge-temp`/`purge`, purge without confirmation |
 | `--min-entropy BITS` | `7.0` | Reject photos with Shannon entropy below this |
 | `--min-brightness 0-255` | `30.0` | Reject photos with mean brightness below this |
 
