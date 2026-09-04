@@ -81,8 +81,8 @@ photo2seed install / photo2seed uninstall    # add / remove the command
 | `--lock-dir DIR` | off | Archive PASS photos to `DIR` (existing or new), sealed read-only; mutually exclusive with `--lock` |
 | `--no-readonly` | off | With `--lock`/`--lock-dir`, keep copies writable (do not `chmod 444`) |
 | `--no-manifest` | off | With `--lock`/`--lock-dir`, skip `SHA512SUMS` and `manifest.json` |
-| `--add-download-random [N]` | off | Fetch N random photos (1-10, default 10) to `/tmp` and MIX with PATH photos; requires PATH; cannot combine with `--download-random` or `--no-mix-rng`; contradictory with `--burn` |
-| `--burn` | off | After derivation delete the `/tmp/photo2seed-*` dir created for this run (requires `--download-random` or `--add-download-random`; mutually exclusive with `--purge-temp`) |
+| `--add-download-random [N]` | off | Fetch N random photos (1-10, default 10) to `/tmp` and MIX with PATH photos; requires PATH; cannot combine with `--download-random` or `--no-mix-rng`; if single `PATH` is a locked dir (`manifest.json`+`SHA512SUMS` present) the `PASS` randoms are **permanently added** to that lock (renamed `name__1.jpg` on collision, sealed `0444`/`uchg`, manifest merged) |
+| `--burn-download-cache` / `--burn` | off | After derivation delete the `/tmp/photo2seed-*` dir created for this run (requires `--download-random` or `--add-download-random`; mutually exclusive with `--purge-temp`; `--burn` kept as alias; when extending a lock the temp is burned but the locked copy remains) |
 | `--purge-temp` / `purge` | off | Find temp folders (`photo2seed-` in `/tmp` and `/var/folders`) and offer to purge with confirmation |
 | `-y` / `--yes` | off | With `--purge-temp`/`purge`, purge without confirmation (not `--force`) |
 | `--min-entropy BITS` | `7.0` | Reject photos with Shannon entropy below this |
@@ -158,9 +158,10 @@ self-tested) is used because cryptography no longer ships RIPEMD-160.
 * `--lock-dir DIR` uses an existing or new `DIR` you choose; mutually exclusive with `--lock`.
 * Sealing: `chmod 0444` + best-effort `chflags uchg` (macOS) / `chattr +i` (Linux). `--no-readonly` keeps `0644` writable. On `vfat`/`exFAT` USB the `chmod` is ignored — the tool warns `(chmod ignored by filesystem)` and you must verify with `ls -l` + `sha512sum -c SHA512SUMS`.
 * Idempotent: if `DIR` already contains a file with same basename and identical `sha512`, it is reused (re-sealed) rather than duplicated as `name__1.jpg`. Different content with same basename becomes `name__1.jpg`, `__2`, etc.
-* Exclusions: `kef_qr.png` (`--out`), the lock dir itself, and `SHA512SUMS`/`manifest.json` are not re-collected; `--download-random` public photos are excluded from the lock (they remain in `/tmp` for entropy only).
+* Exclusions: `kef_qr.png` (`--out`), the lock dir itself, and `SHA512SUMS`/`manifest.json` are not re-collected; `--download-random` public photos are excluded from the lock (they remain in `/tmp` for entropy only) **except** when extending a locked dir (see below).
 * `--lock-dir` cannot be inside a source path (would be re-collected next run) and `--out` inside lock warns.
 * `manifest.json` is privacy-preserving by default — stores only `dst_file` + `sha512`, count, and basename of lock dir (not absolute host `src` paths). `SHA512SUMS` is standard `sha512  filename` lines.
+* Extending a lock: `photo2seed ./ORANGE\(Locked\) --add-download-random 3` where single `PATH` is a locked dir (`manifest.json`+`SHA512SUMS` present) **implicitly extends** that lock — the `PASS` randoms are permanently copied into `ORANGE(Locked)` (renamed `name__1.jpg` on collision, sealed `0444`/`uchg`, `manifest.json`+`SHA512SUMS` merged). Original `PASS` photos stay intact. Add `--burn-download-cache` to delete the temp after.
 
 Examples:
 
@@ -169,6 +170,8 @@ photo2seed photos/ --lock --words 24 --xfp
 photo2seed photos/ --lock-dir ./vault --no-mix-rng --show-words
 photo2seed --no-mix-rng --show-words ./perch-dog      # re-derive from lock
 sha512sum -c ./vault/SHA512SUMS && cat ./vault/manifest.json
+photo2seed "./ORANGE(Locked)" --xfp --derive-only --add-download-random 3  # add 3 PASS randoms to lock (implicit extend, original intact)
+photo2seed "./ORANGE(Locked)" --add-download-random 3 --burn-download-cache --min-entropy 5.0  # add and burn temp
 ```
 
 Unlock (remove read-only) to delete or update:

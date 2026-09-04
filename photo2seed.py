@@ -238,6 +238,25 @@ def _is_subpath(child, parent):
         return False
 
 
+def is_locked_dir(path):
+    """True if path looks like a photo2seed lock dir (has manifest.json and SHA512SUMS)."""
+    try:
+        if not os.path.isdir(path):
+            return False
+        man = os.path.join(path, "manifest.json")
+        sha = os.path.join(path, "SHA512SUMS")
+        if not (os.path.isfile(man) and os.path.isfile(sha)):
+            return False
+        # optional: validate manifest is json with files
+        with open(man, "r") as f:
+            data = json.load(f)
+        if not isinstance(data.get("files"), list):
+            return False
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def archive_pass_photos(accepted, digests_by_path, dest_dir, readonly=True, with_manifest=True):
     """Copy PASS photos to dest_dir, seal read-only, write manifest.
 
@@ -381,7 +400,27 @@ def archive_pass_photos(accepted, digests_by_path, dest_dir, readonly=True, with
             print("[warn] %s chmod ignored (filesystem may not support permissions)" % dst, file=sys.stderr)
 
     if with_manifest and manifest_entries:
-        # SHA512SUMS — fail-fast if cannot write (ENOSPC etc.)
+        # redact absolute src paths: keep only basename for privacy
+        safe_entries = [{"dst_file": e["dst_file"], "sha512": e["sha512"]} for e in manifest_entries]
+        # merge with existing manifest for extend (preserve original PASS photos)
+        man_path = os.path.join(dest_dir, "manifest.json")
+        if os.path.isfile(man_path):
+            try:
+                with open(man_path, "r") as rf:
+                    existing = json.load(rf)
+                existing_files = existing.get("files", [])
+                seen_names = {e["dst_file"] for e in safe_entries}
+                seen_shas = {e["sha512"] for e in safe_entries}
+                merged = list(safe_entries)
+                for ef in existing_files:
+                    if ef.get("dst_file") in seen_names or ef.get("sha512") in seen_shas:
+                        continue
+                    merged.append(ef)
+                merged.sort(key=lambda x: (x.get("dst_file",""), x.get("sha512","")))
+                safe_entries = merged
+            except Exception:
+                pass
+        # SHA512SUMS — fail-fast if cannot write (ENOSPC etc.), write merged
         sha_path = os.path.join(dest_dir, "SHA512SUMS")
         if os.path.lexists(sha_path) and os.path.isdir(sha_path):
             raise SystemExit("[fatal] cannot write SHA512SUMS (is directory): %s" % sha_path)
@@ -389,19 +428,16 @@ def archive_pass_photos(accepted, digests_by_path, dest_dir, readonly=True, with
             clear_immutable(sha_path)
         try:
             with open(sha_path, "w") as f:
-                for e in manifest_entries:
+                for e in safe_entries:
                     f.write("%s  %s\n" % (e["sha512"], e["dst_file"]))
         except OSError as exc:  # noqa: BLE001
             raise SystemExit("[fatal] cannot write SHA512SUMS (%s)" % exc)
         # manifest.json — privacy: store only dst_file+sha512, not absolute src
-        man_path = os.path.join(dest_dir, "manifest.json")
         if os.path.lexists(man_path) and os.path.isdir(man_path):
             raise SystemExit("[fatal] cannot write manifest.json (is directory): %s" % man_path)
         if os.path.exists(man_path):
             clear_immutable(man_path)
         try:
-            # redact absolute src paths: keep only basename for privacy
-            safe_entries = [{"dst_file": e["dst_file"], "sha512": e["sha512"]} for e in manifest_entries]
             manifest = {
                 "version": APP_VERSION,
                 "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -1027,7 +1063,8 @@ examples:
   photo2seed ~/Pictures/trip/                  default: words -> KEF QR PNG + password
   photo2seed --download-random                 fetch 10 random photos to /tmp, derive + QR (stored in system /tmp, not /var/folders)
   photo2seed ./myseedphoto --add-download-random 10  mix 10 random /tmp photos with ./myseedphoto (requires PATH)
-  photo2seed ./myseedphoto --add-download-random 5 --burn  mix 5 random then burn /tmp/photo2seed-* after derivation (contradicts purge)
+  photo2seed ./myseedphoto --add-download-random 5 --burn-download-cache  mix 5 random then burn /tmp/photo2seed-* after derivation
+  photo2seed "./ORANGE(Locked)" --add-download-random 3 --xfp --derive-only  add 3 PASS randoms to locked dir (implicit extend, original intact, renamed on collision)
   photo2seed a.jpg some/dir/ --words 24        24-word seed
   photo2seed photos/ --show-words              also print words/entropy/hashes
   photo2seed photos/ --xfp                     also show master-key fingerprint (XFP)
@@ -1055,7 +1092,7 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] in ("install", "uninstall"):
         (cmd_install if sys.argv[1] == "install" else cmd_uninstall)()
         return
-    if "--burn" in sys.argv and any(x in sys.argv for x in ("purge", "purge-temp", "clean-temp", "--purge-temp")):
+    if any(x in sys.argv for x in ("--burn", "--burn-download-cache")) and any(x in sys.argv for x in ("purge", "purge-temp", "clean-temp", "--purge-temp")):
         raise SystemExit("[fatal] --burn and --purge-temp are mutually exclusive (burn is per-run, purge-temp is global)")
     if len(sys.argv) > 1 and sys.argv[1] in ("purge", "purge-temp", "clean-temp"):
         # don't swallow --help
@@ -1095,12 +1132,19 @@ def main():
         const=10,
         default=None,
         metavar="N",
-        help="fetch N random photos (1-10, default 10) to /tmp and MIX with PATH photos; requires at least one PATH (e.g. photo2seed ./myseedphoto --add-download-random 10)",
+        help="fetch N random photos (1-10, default 10) to /tmp and MIX with PATH photos; requires PATH; if single PATH is a locked dir (has manifest.json) the PASS randoms are permanently added to that lock (renamed on collision, sealed)",
+    )
+    ap.add_argument(
+        "--burn-download-cache",
+        dest="burn",
+        action="store_true",
+        help="after derivation delete the /tmp/photo2seed-* dir created for this run (requires --download-random or --add-download-random); locked copies are kept",
     )
     ap.add_argument(
         "--burn",
+        dest="burn",
         action="store_true",
-        help="after derivation delete the /tmp/photo2seed-* dir created for this run (requires --download-random or --add-download-random)",
+        help=argparse.SUPPRESS,
     )
     ap.add_argument(
         "--words",
@@ -1223,8 +1267,12 @@ def main():
         raise SystemExit("[fatal] use only one of --download-random or --add-download-random")
     if args.burn and args.purge_temp:
         raise SystemExit("[fatal] --burn and --purge-temp are mutually exclusive (burn is per-run, purge-temp is global)")
-    if args.burn and args.add_download_random is not None:
-        raise SystemExit("[fatal] --burn and --add-download-random are contradictory (burn would delete the just-added random photos immediately after use)")
+    # detect implicit extend: single PATH is a locked dir + add-download-random => persist to that lock
+    _is_extend = False
+    if args.add_download_random is not None and len(args.paths) == 1 and args.paths[0] and is_locked_dir(args.paths[0]):
+        _is_extend = True
+    if args.burn and args.add_download_random is not None and not _is_extend:
+        raise SystemExit("[fatal] --burn and --add-download-random are contradictory (burn would delete the just-added random photos immediately after use); use --burn-download-cache only with standalone --download-random or add --lock-dir to persist")
     # burn requires a temp download to burn
     if args.burn and args.download_random is None and args.add_download_random is None:
         raise SystemExit("[fatal] --burn requires --download-random or --add-download-random (nothing to burn)")
@@ -1291,6 +1339,22 @@ def main():
             raise SystemExit("[fatal] lock dir not writable %s (%s)" % (abs_lock, exc))
         if not args.derive_only and _is_subpath(os.path.abspath(args.out), abs_lock):
             print("[warn] --out %s is inside lock dir %s — QR will be inside lock and excluded from future collects" % (args.out, abs_lock), file=sys.stderr)
+
+    # implicit extend: single PATH is a locked dir + --add-download-random => persist random PASS into that lock
+    if _is_extend and early_lock_dir is None:
+        early_lock_dir = os.path.realpath(args.paths[0])
+        abs_lock = os.path.abspath(early_lock_dir)
+        # validate writability for implicit extend (probe parent)
+        try:
+            parent = os.path.dirname(abs_lock) or "."
+            if not os.path.isdir(parent):
+                raise OSError("parent not a directory: %s" % parent)
+            probe = os.path.join(parent, ".photo2seed_probe_%d" % (time.time_ns() % 1000000))
+            with open(probe, "w") as f:
+                f.write("probe")
+            os.remove(probe)
+        except OSError as exc:  # noqa: BLE001
+            raise SystemExit("[fatal] lock dir not writable %s (%s)" % (abs_lock, exc))
 
     tmp_download_dir = None
     if has_download:
@@ -1417,16 +1481,40 @@ def main():
     # reuse early validation; early_lock_dir already probed before password
     lock_dir = early_lock_dir
     if lock_dir is not None:
-        # exclude downloaded public photos from deterministic lock
-        lock_accepted = accepted
-        if tmp_download_dir is not None:
-            tmp_abs = os.path.abspath(tmp_download_dir)
-            filtered = [p for p in accepted if not _is_subpath(os.path.abspath(p), tmp_abs)]
-            if len(filtered) != len(accepted):
-                print("[warn] --download-random photos are public and excluded from lock (CSPRNG protects seed)" , file=sys.stderr)
-            lock_accepted = filtered
-            if not lock_accepted:
-                print("[warn] no private PASS photos to lock after excluding --download-random", file=sys.stderr)
+        # extend mode: single PATH is a locked dir + --add-download-random => persist random PASS into that lock
+        if _is_extend:
+            if tmp_download_dir is not None:
+                tmp_abs = os.path.abspath(tmp_download_dir)
+                random_pass = [p for p in accepted if _is_subpath(os.path.abspath(p), tmp_abs)]
+                if not random_pass:
+                    print("[warn] no PASS random photos to add to lock (all random were REJECT)" , file=sys.stderr)
+                    lock_accepted = []
+                else:
+                    lock_accepted = random_pass
+                    print("[info] extending locked dir %s with %d PASS random photos (renaming on collision, sealed read-only)" % (lock_dir, len(lock_accepted)), file=sys.stderr)
+            else:
+                lock_accepted = []
+        elif early_lock_dir is not None and is_locked_dir(early_lock_dir) and has_download and add_download_count is not None:
+            # explicit lock dir that already exists and is locked, with add-download: also extend with random PASS
+            tmp_abs = os.path.abspath(tmp_download_dir) if tmp_download_dir else ""
+            random_pass = [p for p in accepted if tmp_abs and _is_subpath(os.path.abspath(p), tmp_abs)]
+            if not random_pass:
+                print("[warn] no PASS random photos to add to existing lock (all random were REJECT)" , file=sys.stderr)
+                lock_accepted = []
+            else:
+                lock_accepted = random_pass
+                print("[info] extending existing locked dir %s with %d PASS random photos (renaming on collision, sealed read-only)" % (lock_dir, len(lock_accepted)), file=sys.stderr)
+        else:
+            # normal lock: exclude downloaded public photos from deterministic lock
+            lock_accepted = accepted
+            if tmp_download_dir is not None:
+                tmp_abs = os.path.abspath(tmp_download_dir)
+                filtered = [p for p in accepted if not _is_subpath(os.path.abspath(p), tmp_abs)]
+                if len(filtered) != len(accepted):
+                    print("[warn] --download-random photos are public and excluded from lock (CSPRNG protects seed)" , file=sys.stderr)
+                lock_accepted = filtered
+                if not lock_accepted:
+                    print("[warn] no private PASS photos to lock after excluding --download-random", file=sys.stderr)
         if lock_accepted:
             digests_by_path = {p: d.hex() for p, d in entries if p in set(lock_accepted)}
             # ensure digests for filtered still available
